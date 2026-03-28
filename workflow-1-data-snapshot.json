@@ -1,0 +1,106 @@
+{
+  "name": "MB Advisor — 1. Daily Data Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "type": "cron",
+          "value": "0 8 * * *"
+        }
+      },
+      "id": "trigger",
+      "name": "Daily 8am Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT platform, entity_type, entity_id, entity_name, date, spend, impressions, clicks, conversions, cpa, roas, ctr, cpm FROM normalised_ad_data WHERE date >= CURRENT_DATE - INTERVAL '14 days' ORDER BY entity_id, date ASC"
+      },
+      "id": "fetch-data",
+      "name": "Fetch 14-Day Ad Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Neon - Media Buying DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map(i => i.json);\nconst groups = {};\nfor (const row of items) {\n  if (!groups[row.entity_id]) groups[row.entity_id] = [];\n  groups[row.entity_id].push(row);\n}\n\nconst summaries = [];\n// For MVP with seed data (7 days max), we will split the rows dynamically\nfor (const entity_id in groups) {\n  const rows = groups[entity_id].sort((a,b) => new Date(a.date) - new Date(b.date));\n  \n  const current = rows.slice(-7);\n  const prior = rows.length > 7 ? rows.slice(-14, -7) : rows.slice(0, Math.floor(rows.length/2));\n  \n  const avg = (arr, col) => arr.length ? arr.reduce((sum, r) => sum + parseFloat(r[col]||0), 0) / arr.length : 0;\n  \n  const currentCPA = avg(current, 'cpa');\n  const priorCPA = avg(prior, 'cpa') || currentCPA;\n  \n  const currentROAS = avg(current, 'roas');\n  const priorROAS = avg(prior, 'roas') || currentROAS;\n\n  const pctChange = (curr, prev) => prev === 0 ? 0 : ((curr - prev) / prev) * 100;\n  \n  const cpaAlert = currentCPA > priorCPA * 1.3;\n  const roasAlert = currentROAS < priorROAS * 0.7;\n  const pauseSignal = currentCPA > 40 && cpaAlert;\n  const scaleSignal = currentROAS > 4.0 && currentCPA < 15;\n  \n  summaries.push({\n    entity_id: entity_id,\n    entity_name: current[0].entity_name,\n    platform: current[0].platform,\n    entity_type: current[0].entity_type,\n    key_metrics: {\n      current_cpa: currentCPA.toFixed(2),\n      prior_cpa: priorCPA.toFixed(2),\n      cpa_change_pct: pctChange(currentCPA, priorCPA).toFixed(1),\n      current_roas: currentROAS.toFixed(2),\n      prior_roas: priorROAS.toFixed(2),\n      roas_change_pct: pctChange(currentROAS, priorROAS).toFixed(1)\n    },\n    signals: { cpaAlert, roasAlert, pauseSignal, scaleSignal }\n  });\n}\n\nreturn { json: { data: summaries } };"
+      },
+      "id": "calc-trends",
+      "name": "Calculate 7d vs Prior 7d Trends",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "",
+        "mode": "each"
+      },
+      "id": "exec-wf",
+      "name": "Trigger Analysis Workflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        600,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 8am Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch 14-Day Ad Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch 14-Day Ad Data": {
+      "main": [
+        [
+          {
+            "node": "Calculate 7d vs Prior 7d Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate 7d vs Prior 7d Trends": {
+      "main": [
+        [
+          {
+            "node": "Trigger Analysis Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

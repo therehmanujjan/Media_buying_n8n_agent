@@ -1,0 +1,251 @@
+{
+  "name": "MB Advisor — 2. AI Analysis & Slack Digest",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "wf-trigger",
+      "name": "Receive Ad Data",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.all()[0].json.data || $input.all().map(i => i.json);\nconst prompt = `SYSTEM:\nYou are an expert media buying analyst. You analyse paid advertising performance data and generate prioritised, actionable recommendations. You respond ONLY with valid JSON matching the schema provided. Never add explanations outside the JSON.\n\nUSER:\nAnalyse the following 7-day ad performance data (with prior 7-day trend comparison) and generate recommendations.\n\nPERFORMANCE BENCHMARKS (targets):\n- CPA target: $20 or below\n- ROAS target: 3.0 or above\n- CTR healthy: above 1.0%\n- Pause threshold: CPA above $40 for 3+ consecutive days OR ROAS below 1.0\n\nDECISION RULES:\n- PAUSE: CPA > 2x benchmark for 3+ days, or ROAS < 1.0\n- DECREASE_BUDGET: CPA trending up >30%, ROAS trending down >20%\n- INCREASE_BUDGET: ROAS > 1.5x target AND CPA < 70% of benchmark\n- REALLOCATE: One platform significantly outperforming another by same budget\n- MONITOR: Mixed signals, insufficient data, or minor variance within 15%\n\nAD PERFORMANCE DATA:\n${JSON.stringify(data)}\n\nRespond with ONLY this JSON structure, no other text:\n{\n  \"recommendations\": [\n    {\n      \"entity_id\": \"string\",\n      \"entity_name\": \"string\",\n      \"platform\": \"meta|google|tiktok\",\n      \"action\": \"pause|increase_budget|decrease_budget|reallocate|monitor\",\n      \"priority\": \"high|medium|low\",\n      \"rationale\": \"2-3 sentence plain English explanation of why\",\n      \"estimated_impact\": \"Specific expected outcome e.g. Save $1,400/week by pausing\",\n      \"confidence\": 0.0 to 1.0,\n      \"key_metrics\": {\n        \"current_cpa\": 0,\n        \"prior_cpa\": 0,\n        \"current_roas\": 0,\n        \"prior_roas\": 0,\n        \"cpa_change_pct\": 0,\n        \"roas_change_pct\": 0\n      }\n    }\n  ],\n  \"summary\": \"One sentence overall account health assessment\"\n}`;\n\nreturn { json: { prompt } };"
+      },
+      "id": "build-prompt",
+      "name": "Build Gemini Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contents\": [\n    {\n      \"role\": \"user\",\n      \"parts\": [{ \"text\": {{ JSON.stringify($json.prompt) }} }]\n    }\n  ],\n  \"generationConfig\": {\n    \"temperature\": 0.2,\n    \"responseMimeType\": \"application/json\"\n  }\n}"
+      },
+      "id": "call-gemini",
+      "name": "Gemini 2.0 Flash Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        400,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Gemini API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawText = $input.all()[0].json.candidates[0].content.parts[0].text;\nlet parsed;\ntry {\n  parsed = JSON.parse(rawText);\n} catch (e) {\n  throw new Error(\"Failed to parse Gemini response: \" + e.message + \" | Text: \" + rawText);\n}\nreturn parsed.recommendations.map(r => ({ json: r }));"
+      },
+      "id": "parse-rec",
+      "name": "Parse Recommendations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO recommendations (run_date, platform, entity_type, entity_id, entity_name, action, priority, rationale, metrics_snapshot, estimated_impact, confidence, status) VALUES (CURRENT_DATE, $1, 'campaign', $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 'pending') RETURNING id",
+        "additionalFields": {
+          "queryParams": "={{$json.platform}},{{$json.entity_id}},{{$json.entity_name}},{{$json.action}},{{$json.priority}},{{$json.rationale}},{{JSON.stringify($json.key_metrics)}},{{$json.estimated_impact}},{{$json.confidence}}"
+        }
+      },
+      "id": "save-rec",
+      "name": "Save to Neon",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Neon - Media Buying DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.all()[0].json;\nconst originalData = $('Parse Recommendations').itemMatching(0).json;\nconst recId = item.id;\n\nconst emoji = originalData.priority === 'high' ? '🔴' : originalData.priority === 'medium' ? '🟡' : '🟢';\n\nconst blocks = [\n  {\n    type: \"header\",\n    text: { type: \"plain_text\", text: `${emoji} Campaign Recommendation` }\n  },\n  {\n    type: \"section\",\n    text: { type: \"mrkdwn\", text: `*${originalData.entity_name}*\\n*${originalData.action.toUpperCase()}*` }\n  },\n  {\n    type: \"section\",\n    fields: [\n      { type: \"mrkdwn\", text: `*Current CPA:* $${originalData.key_metrics.current_cpa}` },\n      { type: \"mrkdwn\", text: `*Prior CPA:* $${originalData.key_metrics.prior_cpa}` },\n      { type: \"mrkdwn\", text: `*Current ROAS:* ${originalData.key_metrics.current_roas}` },\n      { type: \"mrkdwn\", text: `*Prior ROAS:* ${originalData.key_metrics.prior_roas}` },\n      { type: \"mrkdwn\", text: `*CPA Change:* ${originalData.key_metrics.cpa_change_pct > 0 ? '⬆️' : '⬇️'} ${originalData.key_metrics.cpa_change_pct}%` },\n      { type: \"mrkdwn\", text: `*ROAS Change:* ${originalData.key_metrics.roas_change_pct > 0 ? '⬆️' : '⬇️'} ${originalData.key_metrics.roas_change_pct}%` }\n    ]\n  },\n  { type: \"divider\" },\n  {\n    type: \"context\",\n    elements: [ { type: \"mrkdwn\", text: `*Impact:* ${originalData.estimated_impact}\\n*Rationale:* ${originalData.rationale}` } ]\n  },\n  {\n    type: \"actions\",\n    elements: [\n      {\n        type: \"button\",\n        text: { type: \"plain_text\", text: \"Approve\" },\n        style: \"primary\",\n        action_id: \"approve_recommendation\",\n        value: JSON.stringify({ recommendation_id: recId, entity_name: originalData.entity_name, action: originalData.action })\n      },\n      {\n        type: \"button\",\n        text: { type: \"plain_text\", text: \"Reject\" },\n        style: \"danger\",\n        action_id: \"reject_recommendation\",\n        value: JSON.stringify({ recommendation_id: recId, entity_name: originalData.entity_name, action: originalData.action })\n      }\n    ]\n  }\n];\n\nreturn {\n  json: {\n    blocks: blocks,\n    fallback_text: `${emoji} ${originalData.entity_name}: ${originalData.action.toUpperCase()}`,\n    recommendation_id: recId\n  }\n};"
+      },
+      "id": "build-slack",
+      "name": "Build Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"C0AQ8JB3D4G\",\n  \"text\": {{$json.fallback_text}},\n  \"blocks\": {{$json.blocks}}\n}"
+      },
+      "id": "post-slack",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1200,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Slack Bot Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE recommendations SET slack_message_ts = $1, slack_channel_id = $2 WHERE id = $3",
+        "additionalFields": {
+          "queryParams": "={{$json.ts}},{{$json.channel}},{{$('Build Slack Message').itemMatching(0).json.recommendation_id}}"
+        }
+      },
+      "id": "update-db",
+      "name": "Store Slack Message TS",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [
+        1400,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Neon - Media Buying DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Receive Ad Data": {
+      "main": [
+        [
+          {
+            "node": "Build Gemini Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Gemini Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini 2.0 Flash Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini 2.0 Flash Analysis": {
+      "main": [
+        [
+          {
+            "node": "Parse Recommendations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Recommendations": {
+      "main": [
+        [
+          {
+            "node": "Save to Neon",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Neon": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Slack": {
+      "main": [
+        [
+          {
+            "node": "Store Slack Message TS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

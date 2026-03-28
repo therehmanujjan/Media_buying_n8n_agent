@@ -1,0 +1,155 @@
+{
+  "name": "MB Advisor — 3. Slack Interactive Webhook",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "slack-interactive",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Slack Action Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "slack-interactive-1234"
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawBody = $input.all()[0].json.body;\nlet payloadStr = rawBody.payload;\nif (typeof payloadStr === 'string') {\n  try {\n    payloadStr = JSON.parse(payloadStr);\n  } catch (e) {}\n}\n\nconst action = payloadStr.actions[0];\nconst actionId = action.action_id; // approve_recommendation or reject_recommendation\nconst val = JSON.parse(action.value);\n\nconst newStatus = actionId.includes('approve') ? 'approved' : 'rejected';\nconst responseUrl = payloadStr.response_url;\n\nreturn {\n  json: {\n    recommendation_id: val.recommendation_id,\n    entity_name: val.entity_name,\n    status: newStatus,\n    response_url: responseUrl\n  }\n};"
+      },
+      "id": "parse-slack",
+      "name": "Parse Slack Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE recommendations SET status = $1, decision_date = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *",
+        "additionalFields": {
+          "queryParams": "={{$json.status}},{{$json.recommendation_id}}"
+        }
+      },
+      "id": "update-db",
+      "name": "Update Neon DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [
+        400,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Neon - Media Buying DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO decision_log (recommendation_id, user_id, user_email, decision, decision_time) VALUES ($1, 'slack_user', 'slack_user@example.com', $2, CURRENT_TIMESTAMP)",
+        "additionalFields": {
+          "queryParams": "={{$('Parse Slack Action').itemMatching(0).json.recommendation_id}},{{$('Parse Slack Action').itemMatching(0).json.status}}"
+        }
+      },
+      "id": "log-decision",
+      "name": "Log Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [
+        600,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Neon - Media Buying DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$('Parse Slack Action').itemMatching(0).json.response_url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"replace_original\": true,\n  \"text\": \"Recommendation {{$('Parse Slack Action').itemMatching(0).json.status}} for {{$('Parse Slack Action').itemMatching(0).json.entity_name}}.\"\n}"
+      },
+      "id": "reply-slack",
+      "name": "Reply to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        800,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Slack Action Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Slack Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Slack Action": {
+      "main": [
+        [
+          {
+            "node": "Update Neon DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Neon DB": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Decision": {
+      "main": [
+        [
+          {
+            "node": "Reply to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
